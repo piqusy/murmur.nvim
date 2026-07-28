@@ -22,26 +22,87 @@ local visible = {}
 local sync_timers = {}
 -- bufnr → bool (suppress watcher during own writes)
 local suppress = {}
+-- bufnr → bool (true when viewing a non-worktree git revision: staged/HEAD/commit)
+local foreign = {}
+-- bufnr → rev string (for visual badge), nil for worktree
+local rev_info = {}
 -- render mode: "box" (default) | "inline" — toggled by M.toggle_mode.
 -- A ◉ sign is always shown in the sign column when a murmur exists.
 local render_mode = config.options.render_mode
 local state_path = vim.fn.stdpath("data") .. "/murmur.json"
 
+-- Resolve a buffer to its real source file and git revision.
+-- Returns { path = string, rev = string?, foreign = bool } or nil.
+local function resolve_source(bufnr)
+  local name = vim.api.nvim_buf_get_name(bufnr)
+
+  -- Fugitive: fugitive://<repo>/.git//<rev>/<relpath>
+  --   rev "0" = index/staged, "HEAD" = HEAD, "<sha>" = commit
+  local repo, rev, rel = name:match("^fugitive://(.+)/%.git//([^/]+)/(.+)$")
+  if repo and rel then
+    return {
+      path = repo .. "/" .. rel,
+      rev = rev,
+      foreign = true,
+    }
+  end
+
+  -- Gitsigns: gitsigns://<repo>/.git//:<rev>:<relpath>
+  --   rev "0" = index/staged, "<sha>" = commit
+  local gs_repo, gs_rev, gs_rel = name:match("^gitsigns://(.+)/%.git//:([^:]+):(.+)$")
+  if gs_repo and gs_rel then
+    return {
+      path = gs_repo .. "/" .. gs_rel,
+      rev = gs_rev,
+      foreign = true,
+    }
+  end
+
+  -- Plain file (worktree)
+  if name ~= "" then
+    return { path = name, rev = nil, foreign = false }
+  end
+  return nil
+end
+
+-- Gate: should murmur attach to this buffer?
+-- Normal files (buftype "") and diff-view buffers (fugitive, gitsigns) only.
+local function should_attach(bufnr)
+  if not resolve_source(bufnr) then return false end
+  local bt = vim.bo[bufnr].buftype
+  if bt == "" then return true end
+  if bt == "nofile" then
+    local name = vim.api.nvim_buf_get_name(bufnr)
+    return name:match("^fugitive://") ~= nil or name:match("^gitsigns://") ~= nil
+  end
+  return false
+end
+
+-- Human-readable rev label for the visual badge.
+local function rev_label(rev)
+  if not rev then return nil end
+  local labels = { ["0"] = "staged", HEAD = "HEAD" }
+  return labels[rev] or rev:sub(1, 7)
+end
+
 -- helpers -------------------------------------------------------------------
 
 local function setup_highlights()
   local hl = config.options.highlights
-  vim.api.nvim_set_hl(0, "MurmurHeader", hl.header)
+  vim.api.nvim_set_hl(0, "MurmurUserHeader", hl.user_header)
+  vim.api.nvim_set_hl(0, "MurmurUserSign", hl.user_sign)
+  vim.api.nvim_set_hl(0, "MurmurAgentHeader", hl.agent_header)
+  vim.api.nvim_set_hl(0, "MurmurAgentSign", hl.agent_sign)
   vim.api.nvim_set_hl(0, "MurmurBody", hl.body)
   vim.api.nvim_set_hl(0, "MurmurBorder", hl.border)
-  vim.api.nvim_set_hl(0, "MurmurSign", hl.sign)
   vim.api.nvim_set_hl(0, "MurmurOrphan", hl.orphan)
+  vim.api.nvim_set_hl(0, "MurmurForeign", hl.foreign)
 end
 
 local function sidecar_path(bufnr)
-  local p = vim.api.nvim_buf_get_name(bufnr)
-  if not p or p == "" then return nil end
-  return p .. config.options.sidecar_suffix
+  local src = resolve_source(bufnr)
+  if not src or src.path == "" then return nil end
+  return src.path .. config.options.sidecar_suffix
 end
 
 local function gen_id()
@@ -78,7 +139,17 @@ end
 local function write_sidecar(bufnr, path, data)
   if not path then return false end
   suppress[bufnr] = true
-  local f = io.open(path, "w")
+  -- Empty data: delete the sidecar rather than writing "[]" to avoid
+  -- overwriting a valid sidecar with an empty array on accidental calls.
+  if not data or #data == 0 then
+    pcall(os.remove, path)
+    suppress[bufnr] = false
+    return true
+  end
+  -- Atomic write: write to temp file, then rename over the target.
+  -- Prevents partial writes if Neovim crashes or is killed mid-write.
+  local tmp = path .. ".tmp"
+  local f = io.open(tmp, "w")
   if not f then
     suppress[bufnr] = false
     vim.notify("murmur: could not write " .. path, vim.log.levels.ERROR)
@@ -86,6 +157,7 @@ local function write_sidecar(bufnr, path, data)
   end
   f:write(vim.json.encode(data))
   f:close()
+  os.rename(tmp, path)
   suppress[bufnr] = false
   return true
 end
@@ -100,6 +172,9 @@ end
 
 local function load_murmurs(bufnr)
   if not vim.api.nvim_buf_is_valid(bufnr) then return {} end
+  local src = resolve_source(bufnr)
+  foreign[bufnr] = src and src.foreign or false
+  rev_info[bufnr] = src and src.rev or nil
   local path = sidecar_path(bufnr)
   local murmurs = read_sidecar(path)
   if #murmurs == 0 then
@@ -120,6 +195,12 @@ local function load_murmurs(bufnr)
       current = (vim.api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1] or "")
     end
 
+    -- backfill anchor for murmurs created by older code
+    if anchor == "" and current ~= "" then
+      m.anchor = current
+      anchor = current
+      changed = true
+    end
     if anchor ~= "" and norm(current) == norm(anchor) then
       -- no drift: anchor matches the stored line
     else
@@ -148,7 +229,7 @@ local function load_murmurs(bufnr)
 
   sort_murmurs(murmurs)
 
-  if changed then
+  if changed and not foreign[bufnr] then
     write_sidecar(bufnr, path, murmurs)
   end
   mem[bufnr] = murmurs
@@ -180,7 +261,7 @@ local function sync_back(bufnr)
     end
   end
 
-  if changed then
+  if changed and not foreign[bufnr] then
     sort_murmurs(murmurs)
     write_sidecar(bufnr, sidecar_path(bufnr), murmurs)
   end
@@ -249,22 +330,29 @@ function M.render(bufnr)
       local row = math.max(0, math.min(line - 1, linecount - 1))
       local author = m.author or "User"
       local message = m.message or ""
-      local orphan = m.orphaned  -- D2: orphan bug fix (was undefined)
+      local orphan = m.orphaned
+      local is_agent = author ~= "User"
+      local is_foreign = foreign[bufnr] or false
+      local sign_hl = orphan and "MurmurOrphan" or (is_foreign and "MurmurForeign" or (is_agent and "MurmurAgentSign" or "MurmurUserSign"))
+      local header_hl = orphan and "MurmurOrphan" or (is_foreign and "MurmurForeign" or (is_agent and "MurmurAgentHeader" or "MurmurUserHeader"))
       local opts = {
         sign_text = config.options.sign_text,
-        sign_hl_group = orphan and "MurmurOrphan" or "MurmurSign",
+        sign_hl_group = sign_hl,
       }
 
       if show_content then
         if render_mode == "inline" then
           opts.virt_text = {
-            { "  " .. (orphan and "⚠ " or ""), orphan and "MurmurOrphan" or "MurmurHeader" },
-            { author .. ": ", "MurmurHeader" },
+            { "  " .. (orphan and "⚠ " or is_foreign and "⊞ " or ""), orphan and "MurmurOrphan" or (is_foreign and "MurmurForeign" or header_hl) },
+            { author .. ": ", header_hl },
             { message, "MurmurBody" },
           }
           opts.virt_text_pos = "eol"
         else -- "box"
           local prefix = orphan and "⚠ ORPHANED " or ""
+          if is_foreign then
+            prefix = prefix .. "⊞ " .. (rev_label(rev_info[bufnr]) or "diff") .. " "
+          end
           local header_label = " ╭─ [" .. author .. "] " .. prefix
           -- cap box width to the buffer's window; -14 ≈ signcol(2)+numcol(≤6)+frame(3)+margin(3)
           local win = vim.fn.bufwinid(bufnr)
@@ -276,18 +364,31 @@ function M.render(bufnr)
           for _, l in ipairs(body_lines) do
             content_w = math.max(content_w, vim.fn.strdisplaywidth(l) + 2)
           end
-          content_w = math.max(28, content_w)
+          content_w = math.max(28, content_w) + 2
           -- header: embed line number on the right when there is room
           local linetext = ":" .. tostring(line)
           local linetxt_w = vim.fn.strdisplaywidth(linetext)
           local gap_w = content_w - vim.fn.strdisplaywidth(header_label) + 2
-          local header
+          local right_side
           if linetxt_w + 4 <= gap_w then
-            header = header_label .. string.rep("─", gap_w - linetxt_w - 3) .. " " .. linetext .. " ─╮"
+            right_side = string.rep("─", gap_w - linetxt_w - 3) .. " " .. linetext .. " ─╮"
           else
-            header = header_label .. string.rep("─", gap_w) .. "╮"
+            right_side = string.rep("─", gap_w) .. "╮"
           end
-          local vl = { { { header, "MurmurHeader" } } }
+          -- build header: border parts are gray, [author] is colored
+          local header_chunks = {
+            { " ╭─ [", "MurmurBorder" },
+            { author, header_hl },
+            { "] ", "MurmurBorder" },
+          }
+          if orphan then
+            table.insert(header_chunks, { "⚠ ORPHANED ", "MurmurOrphan" })
+          end
+          if is_foreign then
+            table.insert(header_chunks, { "⊞ " .. (rev_label(rev_info[bufnr]) or "diff") .. " ", "MurmurForeign" })
+          end
+          table.insert(header_chunks, { right_side, "MurmurBorder" })
+          local vl = { header_chunks }
           for _, l in ipairs(body_lines) do
             local inner = "  " .. l .. string.rep(" ", content_w - 2 - vim.fn.strdisplaywidth(l))
             table.insert(vl, { { " │", "MurmurBorder" }, { inner, "MurmurBody" }, { "│", "MurmurBorder" } })
@@ -306,7 +407,6 @@ function M.render(bufnr)
   extmarks[bufnr] = marks
 end
 
--- D4: toggle_mode replaces cycle_mode (box ↔ inline, persists) ---------------
 
 function M.toggle_mode()
   render_mode = render_mode == "box" and "inline" or "box"
@@ -323,40 +423,61 @@ end
 
 -- public actions ------------------------------------------------------------
 
+-- M.add: programmatic (non-interactive) murmur creation — the agent API.
+-- opts: { bufnr?, line?, author?, message }
+function M.add(opts)
+  opts = opts or {}
+  local bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then return false end
+  if foreign[bufnr] then return false end
+  local path = sidecar_path(bufnr)
+  if not path then return false end
+  sync_back(bufnr)
+  local row = opts.line or vim.api.nvim_win_get_cursor(0)[1]
+  local linecount = vim.api.nvim_buf_line_count(bufnr)
+  row = math.max(1, math.min(row, linecount))
+  local anchor = trim(vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1] or "")
+  local murmurs = mem[bufnr] or {}
+  table.insert(murmurs, {
+    id = gen_id(),
+    line = row,
+    anchor = anchor,
+    author = opts.author or "Agent",
+    message = opts.message or "",
+    created_at = iso_now(),
+    orphaned = false,
+  })
+  sort_murmurs(murmurs)
+  mem[bufnr] = murmurs
+  write_sidecar(bufnr, path, murmurs)
+  M.render(bufnr)
+  return true
+end
+
 function M.add_murmur()
   local bufnr = vim.api.nvim_get_current_buf()
-  local path = sidecar_path(bufnr)
-  if not path then
+  if not sidecar_path(bufnr) then
     vim.notify("murmur: buffer has no file path", vim.log.levels.WARN)
     return
   end
-
+  if foreign[bufnr] then
+    vim.notify("murmur: read-only diff view — edit the worktree buffer", vim.log.levels.WARN)
+    return
+  end
   vim.ui.input({ prompt = "Instruction for agent: " }, function(input)
     if not input or vim.trim(input) == "" then return end
     vim.schedule(function()
-      sync_back(bufnr)
-      local row = vim.api.nvim_win_get_cursor(0)[1]
-      local anchor = trim(vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1] or "")
-      local murmurs = mem[bufnr] or {}
-      table.insert(murmurs, {
-        id = gen_id(),
-        line = row,
-        anchor = anchor,
-        author = "User",
-        message = input,
-        created_at = iso_now(),
-        orphaned = false,
-      })
-      sort_murmurs(murmurs)
-      mem[bufnr] = murmurs
-      write_sidecar(bufnr, path, murmurs)
-      M.render(bufnr)
+      M.add({ bufnr = bufnr, author = "User", message = input })
     end)
   end)
 end
 
 function M.delete_murmur()
   local bufnr = vim.api.nvim_get_current_buf()
+  if foreign[bufnr] then
+    vim.notify("murmur: read-only diff view — edit the worktree buffer", vim.log.levels.WARN)
+    return
+  end
   local murmurs = mem[bufnr] or {}
   if #murmurs == 0 then
     vim.notify("murmur: no murmurs in this buffer", vim.log.levels.INFO)
@@ -385,6 +506,10 @@ end
 
 function M.edit_murmur()
   local bufnr = vim.api.nvim_get_current_buf()
+  if foreign[bufnr] then
+    vim.notify("murmur: read-only diff view — edit the worktree buffer", vim.log.levels.WARN)
+    return
+  end
   local murmurs = mem[bufnr] or {}
   if #murmurs == 0 then
     vim.notify("murmur: no murmurs in this buffer", vim.log.levels.INFO)
@@ -439,6 +564,61 @@ function M.list_murmurs()
   end)
 end
 
+-- M.list_all_murmurs: scan all sidecar files in the project, show every murmur
+-- in a picker. On selection, open the file and jump to the line.
+function M.list_all_murmurs()
+  local cwd = vim.fn.getcwd()
+  local suffix = config.options.sidecar_suffix
+  local ignore_dirs = { ".git", "node_modules", ".venv", "vendor", "dist", "build", ".next", ".deps" }
+  local ignore_set = {}
+  for _, d in ipairs(ignore_dirs) do ignore_set[d] = true end
+
+  local sidecars = vim.fs.find(function(name, path)
+    if name:sub(-#suffix) ~= suffix then return false end
+    for seg in (path .. "/" .. name):gmatch("[^/]+") do
+      if ignore_set[seg] then return false end
+    end
+    return true
+  end, { limit = 200, type = "file", path = cwd })
+
+  local results = {}
+  for _, sc in ipairs(sidecars) do
+    local murmurs = read_sidecar(sc)
+    local base = sc:sub(1, -#suffix - 1)
+    local rel = vim.fn.fnamemodify(base, ":.")
+    for _, m in ipairs(murmurs) do
+      table.insert(results, {
+        file = base,
+        line = tonumber(m.line) or 1,
+        text = string.format("%s:%d  [%s] %s", rel, tonumber(m.line) or 0, m.author or "User", m.message or ""),
+      })
+    end
+  end
+
+  if #results == 0 then
+    vim.notify("murmur: no murmurs found in project", vim.log.levels.INFO)
+    return
+  end
+
+  local items = {}
+  for i, r in ipairs(results) do
+    items[i] = { idx = i, text = r.text }
+  end
+  table.sort(items, function(a, b) return a.text < b.text end)
+
+  picker.open(items, { prompt = "All Murmurs (" .. #results .. ")" }, function(idx)
+    if not idx then return end
+    local r = results[idx]
+    if r then
+      vim.schedule(function()
+        vim.cmd("edit " .. vim.fn.fnameescape(r.file))
+        local lc = vim.api.nvim_buf_line_count(0)
+        vim.api.nvim_win_set_cursor(0, { math.max(1, math.min(r.line, lc)), 0 })
+      end)
+    end
+  end)
+end
+
 function M.toggle()
   local bufnr = vim.api.nvim_get_current_buf()
   if visible[bufnr] == false then
@@ -450,6 +630,39 @@ function M.toggle()
   vim.notify("murmur content " .. (visible[bufnr] == false and "hidden" or "visible"), vim.log.levels.INFO)
 end
 
+
+-- M.delete_file_murmurs: delete all murmurs in a single buffer (persistent).
+-- Removes in-memory state, visual extmarks, and the sidecar file.
+-- Returns the count of murmurs removed.
+function M.delete_file_murmurs(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then return 0 end
+  if foreign[bufnr] then return 0 end
+  local count = #(mem[bufnr] or {})
+  if count == 0 then return 0 end
+  mem[bufnr] = {}
+  extmarks[bufnr] = {}
+  vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
+  local path = sidecar_path(bufnr)
+  if path then
+    suppress[bufnr] = true
+    pcall(os.remove, path)
+    suppress[bufnr] = false
+  end
+  return count
+end
+
+-- M.delete_all_murmurs: delete all murmurs across every open buffer (persistent).
+-- Returns the total count of murmurs removed.
+function M.delete_all_murmurs()
+  local total = 0
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and mem[b] and #mem[b] > 0 and not foreign[b] then
+      total = total + M.delete_file_murmurs(b)
+    end
+  end
+  return total
+end
 -- watcher --------------------------------------------------------------------
 
 local function stop_watcher(bufnr)
@@ -519,8 +732,7 @@ function M.setup(opts)
     group = group,
     pattern = "*",
     callback = function(args)
-      if vim.bo[args.buf].buftype ~= "" then return end
-      if not sidecar_path(args.buf) then return end
+      if not should_attach(args.buf) then return end
       refresh(args.buf)
     end,
   })
@@ -529,7 +741,7 @@ function M.setup(opts)
     group = group,
     pattern = "*",
     callback = function(args)
-      if vim.bo[args.buf].buftype ~= "" then return end
+      if not should_attach(args.buf) or foreign[args.buf] then return end
       if mem[args.buf] then sync_back(args.buf) end
     end,
   })
@@ -538,7 +750,7 @@ function M.setup(opts)
     group = group,
     pattern = "*",
     callback = function(args)
-      if vim.bo[args.buf].buftype ~= "" then return end
+      if not should_attach(args.buf) or foreign[args.buf] then return end
       if mem[args.buf] and #mem[args.buf] > 0 then
         debounced_sync(args.buf)
       end
@@ -558,6 +770,9 @@ function M.setup(opts)
       mem[args.buf] = nil
       extmarks[args.buf] = nil
       visible[args.buf] = nil
+      foreign[args.buf] = nil
+      rev_info[args.buf] = nil
+      suppress[args.buf] = nil
     end,
   })
 
@@ -569,8 +784,30 @@ function M.setup(opts)
 
   vim.api.nvim_create_user_command("MurmurAdd", function() M.add_murmur() end, {})
   vim.api.nvim_create_user_command("MurmurDelete", function() M.delete_murmur() end, {})
+  vim.api.nvim_create_user_command("MurmurDeleteFile", function()
+    local n = M.delete_file_murmurs()
+    vim.notify(
+      n > 0 and ("murmur: deleted " .. n .. " murmur(s) in this file")
+        or "murmur: no murmurs in this buffer",
+      vim.log.levels.INFO
+    )
+  end, {})
+  vim.api.nvim_create_user_command("MurmurDeleteAll", function()
+    vim.ui.select({ "yes", "no" }, { prompt = "Delete all murmurs in every open buffer?" }, function(choice)
+      if choice ~= "yes" then return end
+      vim.schedule(function()
+        local n = M.delete_all_murmurs()
+        vim.notify(
+          n > 0 and ("murmur: deleted " .. n .. " murmur(s) across all buffers")
+            or "murmur: no murmurs found",
+          vim.log.levels.INFO
+        )
+      end)
+    end)
+  end, {})
   vim.api.nvim_create_user_command("MurmurEdit", function() M.edit_murmur() end, {})
   vim.api.nvim_create_user_command("MurmurList", function() M.list_murmurs() end, {})
+  vim.api.nvim_create_user_command("MurmurListAll", function() M.list_all_murmurs() end, {})
   vim.api.nvim_create_user_command("MurmurToggle", function() M.toggle() end, {})
   vim.api.nvim_create_user_command("MurmurMode", function() M.toggle_mode() end, {})
   vim.api.nvim_create_user_command("MurmurClear", function()
@@ -589,16 +826,18 @@ function M.setup(opts)
   -- setup runs at VeryLazy, after the initial BufReadPost/BufEnter already
   -- fired; load sidecars for buffers already open so startup isn't a no-op.
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_loaded(b) and vim.bo[b].buftype == "" and sidecar_path(b) then
+    if vim.api.nvim_buf_is_loaded(b) and should_attach(b) then
       refresh(b)
     end
   end
 end
 
--- D7: expose internals for testability
+-- expose internals for testability
 M._wrap = wrap_text
 M._read_sidecar = read_sidecar
 M._write_sidecar = write_sidecar
 M._config = config
+M._load_murmurs = load_murmurs
+M._resolve_source = resolve_source
 
 return M
