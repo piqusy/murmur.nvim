@@ -1,6 +1,6 @@
 # murmur.nvim
 
-Inline line annotations for Neovim — leave instructions for your AI agent (or future-you) directly on source lines. Murmurs render as boxed virtual text below the anchored line, or as compact end-of-line shadow text, with a persistent sign-column indicator so you always know where annotations live.
+Inline line annotations for Neovim — leave instructions for your AI agent (or future-you) directly on source lines. Murmurs render as boxed virtual text above the anchored line, or as compact end-of-line shadow text, with a persistent sign-column indicator so you always know where annotations live.
 
 This package is the Neovim-only mirror of the [piqusy/murmur](https://github.com/piqusy/murmur) project. The Lua plugin lives under `lua/murmur/`. Agent integration code (OMP, OpenCode, Claude Code, Codex, Antigravity) lives in the upstream `piqusy/murmur` repository and is installed separately.
 
